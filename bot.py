@@ -29,8 +29,10 @@ lock = asyncio.Lock()
 S = {"pw": None, "browser": None, "page": None, "waiting": False,
      "chat": None, "ts": None, "task": None, "night": False}
 day_store = {}
+KB = ReplyKeyboardMarkup([[BTN_RES], [BTN_LINE]], resize_keyboard=True)
 
 def now(): return datetime.now(MSK)
+def label(iso): return datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y") if iso else now().strftime("%d.%m.%Y")
 def load_meta():
     try: return json.loads(META_FILE.read_text())
     except Exception: return {}
@@ -38,7 +40,6 @@ META = load_meta()
 def save_meta():
     try: META_FILE.write_text(json.dumps(META))
     except Exception: pass
-def label(iso): return datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y") if iso else now().strftime("%d.%m.%Y")
 
 def proxy_cfg():
     if not PROXY_URL: return None
@@ -85,7 +86,6 @@ async def dismiss_banners(page):
             if await b.count(): await b.first.click(timeout=700)
         except Exception: pass
 
-# ---------- сбор строк со страницы (селекторы из твоих скриптов) ----------
 COLLECT_RES = """() => {
   const out = [];
   document.querySelectorAll('div[class*="results-event--"]').forEach(row => {
@@ -157,7 +157,7 @@ async def scroll_collect(page, js):
     found, last, stuck, steps = {}, -1, 0, 0
     while stuck < 5 and steps < 150:
         for r in await page.evaluate(js):
-            key = (r.get("tournament", ""), r["time"], r.get("match", r.get("p1", "") + r.get("p2", "")))
+            key = (r.get("tournament", ""), r["time"], r.get("match") or (r.get("p1", "") + "|" + r.get("p2", "")))
             found[key] = r
         await page.evaluate("() => {const c=window.__sc; if(c===document.documentElement)window.scrollBy(0,700);else c.scrollTop+=700;}")
         await page.wait_for_timeout(700)
@@ -166,7 +166,6 @@ async def scroll_collect(page, js):
         last = cur; steps += 1
     return list(found.values())
 
-# ---------- CSV ----------
 def make_results_csv(raw, date_str, drop_yesterday):
     store = day_store.setdefault(date_str, {})
     for r in raw:
@@ -212,7 +211,6 @@ def make_line_csv(raw):
     w.writerows(data)
     return len(data), buf.getvalue().encode("utf-8")
 
-# ---------- открытие страницы / выполнение задачи ----------
 def task_urls(task):
     if task[0] == "results":
         return [URL_RES + (f"?date={task[1]}" if task[1] else "")]
@@ -234,7 +232,7 @@ async def open_page(task):
             return "ok"
         except Exception:
             continue
-    if task[0] == "line":   # запасной путь: кликнуть спорт в сайдбаре
+    if task[0] == "line":
         try:
             await page.goto("https://fon.bet/sports", wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(3000)
@@ -248,8 +246,8 @@ async def open_page(task):
     return "fail"
 
 async def complete_task(bot, chat_id):
-    """Страница открыта (или капча пройдена) — собираем и отправляем."""
     task, night, page = S["task"], S["night"], S["page"]
+    if task is None: task = ("results", None)
     sel = SEL_LINE if task[0] == "line" else SEL_RES
     if not await page.locator(sel).count():
         st = await open_page(task)
@@ -300,10 +298,8 @@ async def run_task(bot, chat_id, task, night=False):
             await close_session(False)
             await bot.send_photo(chat_id, shot, caption="❌ Страница не прогрузилась (блок IP / капча / другой URL линии).")
             return
+        S.update(task=task, night=night, chat=chat_id)   # запомнили задачу ДО сбора (фикс бага)
         await complete_task(bot, chat_id)
-
-# ---------- команды ----------
-KB = ReplyKeyboardMarkup([[BTN_RES], [BTN_LINE]], resize_keyboard=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     META["chat_id"] = update.effective_chat.id; save_meta()
@@ -413,7 +409,7 @@ def main():
     app.add_handler(MessageHandler(filters.Text([BTN_LINE]), line_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, captcha_answer))
     app.job_queue.run_daily(night_job, time=dtime(hour=NIGHT_HOUR, minute=0, tzinfo=MSK))
-    log.info("Бот запущен: результаты + линия, ночная выгрузка в %02d:00 МСК", NIGHT_HOUR)
+    log.info("Бот запущен: результаты + линия, ночь в %02d:00 МСК", NIGHT_HOUR)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
