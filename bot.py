@@ -10,20 +10,24 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PROXY_URL = os.environ.get("PROXY_URL")
+LINE_URL = os.environ.get("LINE_URL", "https://fon.bet/sports/table-tennis")
 MSK = pytz.timezone("Europe/Moscow")
-URL = "https://fon.bet/results/table-tennis"
-BTN = "📊 Результаты за сегодня"
-STATE_FILE = Path("fon_state.json")   # cookies после капчи
-META_FILE = Path("bot_meta.json")     # chat_id + дата последнего ручного запроса
+URL_RES = "https://fon.bet/results/table-tennis"
+BTN_RES = "📊 Результаты за сегодня"
+BTN_LINE = "📋 Линия ТТ"
+STATE_FILE = Path("fon_state.json")
+META_FILE = Path("bot_meta.json")
 NIGHT_HOUR = int(os.environ.get("NIGHT_HOUR_MSK", "1"))
-CAPTCHA_IDLE_MIN = 15                 # ожидание ответа на капчу днём
-NIGHT_IDLE_HOURS = 8                  # ...и ночью (ответишь утром)
+CAPTCHA_IDLE_MIN = 15
+NIGHT_IDLE_HOURS = 8
+SEL_RES = 'div[class*="results-event--"]'
+SEL_LINE = 'div[class*="sport-base-event--"]'
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tt-bot")
 lock = asyncio.Lock()
 S = {"pw": None, "browser": None, "page": None, "waiting": False,
-     "chat": None, "target": None, "night": False, "ts": None}
+     "chat": None, "ts": None, "task": None, "night": False}
 day_store = {}
 
 def now(): return datetime.now(MSK)
@@ -34,6 +38,7 @@ META = load_meta()
 def save_meta():
     try: META_FILE.write_text(json.dumps(META))
     except Exception: pass
+def label(iso): return datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y") if iso else now().strftime("%d.%m.%Y")
 
 def proxy_cfg():
     if not PROXY_URL: return None
@@ -41,9 +46,6 @@ def proxy_cfg():
     cfg = {"server": f"{u.scheme}://{u.hostname}" + (f":{u.port}" if u.port else "")}
     if u.username: cfg["username"], cfg["password"] = u.username, u.password or ""
     return cfg
-
-def url_for(iso): return URL + (f"?date={iso}" if iso else "")
-def label(iso): return datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y") if iso else now().strftime("%d.%m.%Y")
 
 async def close_session(save=False):
     try:
@@ -53,7 +55,7 @@ async def close_session(save=False):
         if S["browser"]: await S["browser"].close()
         if S["pw"]: await S["pw"].stop()
     except Exception: pass
-    S.update(pw=None, browser=None, page=None, waiting=False, chat=None, target=None, night=False, ts=None)
+    S.update(pw=None, browser=None, page=None, waiting=False, chat=None, ts=None, task=None, night=False)
 
 def idle_expired():
     if not S["waiting"] or not S["ts"]: return False
@@ -76,7 +78,15 @@ async def captcha_field(page):
     if await loc.count() and await loc.first.is_visible(): return loc.first
     return None
 
-COLLECT_JS = """() => {
+async def dismiss_banners(page):
+    for txt in ("Принять", "Согласен", "Понятно", "OK"):
+        try:
+            b = page.get_by_text(txt, exact=True)
+            if await b.count(): await b.first.click(timeout=700)
+        except Exception: pass
+
+# ---------- сбор строк со страницы (селекторы из твоих скриптов) ----------
+COLLECT_RES = """() => {
   const out = [];
   document.querySelectorAll('div[class*="results-event--"]').forEach(row => {
     let tournament = "Неизвестный турнир";
@@ -102,7 +112,43 @@ COLLECT_JS = """() => {
   return out;
 }"""
 
-async def harvest(page):
+COLLECT_LINE = """() => {
+  const out = [];
+  let cur = "Неизвестный турнир";
+  document.querySelectorAll('div[class*="table-component-text--"], div[class*="sport-base-event--"]').forEach(el => {
+    const cls = el.className;
+    if (cls.includes('table-component-text--') && !cls.includes('sport-base-event')) {
+      const txt = el.innerText.trim();
+      if (txt.length > 5 && (txt.includes('.') || txt.includes('Лига') || txt.includes('Cup') || txt.includes('Москва') || txt.includes('Минск'))) {
+        if (!txt.includes('ФОРА') && !txt.includes('ТОТАЛ') && !txt.includes('ИСХОД')) cur = txt.split('\\n')[0].trim();
+      }
+    }
+    if (cls.includes('sport-base-event--')) {
+      const nameEl = el.querySelector('a[class*="sport-event__name--"]');
+      const match = nameEl ? nameEl.innerText.trim() : '';
+      const timeEl = el.querySelector('span[class*="event-block-planned-time__time--"]');
+      const time = timeEl ? timeEl.innerText.trim() : '?';
+      let p1='',p2='',f1='',k1='',f2='',k2='',total='',over='',under='';
+      const singles=[], complexes=[];
+      el.querySelectorAll('div[class*="factor-value--"]').forEach(f => {
+        const c = f.className;
+        if (c.includes('table-component-factor-value_single--')) singles.push(f.innerText.trim());
+        else if (c.includes('table-component-factor-value_complex--')) {
+          const lines = f.innerText.split('\\n').map(l => l.trim()).filter(l => l);
+          if (lines.length >= 2) complexes.push(lines);
+        } else if (c.includes('table-component-factor-value_param--')) total = f.innerText.trim();
+      });
+      if (singles.length >= 2) { p1 = singles[0]; p2 = singles[1]; }
+      if (complexes.length >= 2) { f1 = complexes[0][0]; k1 = complexes[0][1]; f2 = complexes[1][0]; k2 = complexes[1][1]; }
+      if (singles.length >= 4) { over = singles[2]; under = singles[3]; }
+      else if (singles.length === 3) over = singles[2];
+      if (match) out.push({tournament: cur, time, match, p1, p2, f1, k1, f2, k2, total, over, under});
+    }
+  });
+  return out;
+}"""
+
+async def scroll_collect(page, js):
     await page.evaluate("""() => {
         let best=document.documentElement,h=0;
         document.querySelectorAll('*').forEach(el=>{if(el.scrollHeight>el.clientHeight&&el.scrollHeight>h){h=el.scrollHeight;best=el;}});
@@ -110,8 +156,9 @@ async def harvest(page):
     }""")
     found, last, stuck, steps = {}, -1, 0, 0
     while stuck < 5 and steps < 150:
-        for r in await page.evaluate(COLLECT_JS):
-            found[(r["time"], r["p1"], r["p2"])] = r
+        for r in await page.evaluate(js):
+            key = (r.get("tournament", ""), r["time"], r.get("match", r.get("p1", "") + r.get("p2", "")))
+            found[key] = r
         await page.evaluate("() => {const c=window.__sc; if(c===document.documentElement)window.scrollBy(0,700);else c.scrollTop+=700;}")
         await page.wait_for_timeout(700)
         cur = await page.evaluate("() => {const c=window.__sc; return c===document.documentElement?window.scrollY:c.scrollTop;}")
@@ -119,33 +166,27 @@ async def harvest(page):
         last = cur; steps += 1
     return list(found.values())
 
-def build_rows(raw, date_str, drop_yesterday):
-    out = []
+# ---------- CSV ----------
+def make_results_csv(raw, date_str, drop_yesterday):
+    store = day_store.setdefault(date_str, {})
     for r in raw:
-        t = r["time"]
-        if drop_yesterday and "Вчера" in t: continue
-        m = re.search(r"\d{1,2}:\d{2}", t)
+        if drop_yesterday and "Вчера" in r["time"]: continue
+        m = re.search(r"\d{1,2}:\d{2}", r["time"])
         tm = m.group(0) if m else "?"
         sets, s1, s2, p1, p2 = [], 0, 0, 0, 0
-        for s in r["sets"]:                      # только числовые сеты, без '---'
+        for s in r["sets"]:
             mm = re.match(r"^(\d+)\s*-\s*(\d+)$", s.strip())
             if not mm: continue
             a, b = int(mm.group(1)), int(mm.group(2))
             sets.append(f"{a}-{b}"); p1 += a; p2 += b; s1 += a > b; s2 += b > a
         total = (r["total"] or "").strip()
-        if not sets or total in ("", "0:0"): continue   # мусор/не сыграно — пропускаем
+        if not sets or total in ("", "0:0"): continue
         if ":" in total:
             try: s1, s2 = map(int, total.split(":"))
             except Exception: pass
         else: total = f"{s1}:{s2}"
-        out.append([date_str, tm, r["tournament"], r["p1"], r["p2"], total, " ".join(sets),
-                    s1, s2, p1, p2, p1 + p2, p1 - p2, len(sets)])
-    return out
-
-def make_csv(raw, date_str, drop_yesterday):
-    store = day_store.setdefault(date_str, {})
-    for r in build_rows(raw, date_str, drop_yesterday):
-        store[(r[1], r[3], r[4])] = r
+        store[(tm, r["p1"], r["p2"])] = [date_str, tm, r["tournament"], r["p1"], r["p2"],
+            total, " ".join(sets), s1, s2, p1, p2, p1 + p2, p1 - p2, len(sets)]
     today_lbl = now().strftime("%d.%m.%Y")
     for d in list(day_store):
         if d not in (date_str, today_lbl): del day_store[d]
@@ -157,62 +198,123 @@ def make_csv(raw, date_str, drop_yesterday):
     w.writerows(data)
     return len(data), buf.getvalue().encode("utf-8")
 
-async def run_collect(chat_id, iso=None, night=False):
-    """iso=None → сегодня; iso='ГГГГ-ММ-ДД' → конкретные сутки."""
+def make_line_csv(raw):
+    seen = {}
+    for r in raw:
+        key = (r["tournament"], r["time"], r["match"])
+        if key not in seen:
+            seen[key] = [r["tournament"], r["time"], r["match"], r["p1"], r["p2"],
+                         r["f1"], r["k1"], r["f2"], r["k2"], r["total"], r["over"], r["under"]]
+    data = list(seen.values())
+    buf = io.StringIO(); buf.write("\ufeff")
+    w = csv.writer(buf, delimiter="\t")
+    w.writerow(["Турнир","Время","Матч","П1","П2","Фора 1","Кэф Ф1","Фора 2","Кэф Ф2","Тотал","Больше","Меньше"])
+    w.writerows(data)
+    return len(data), buf.getvalue().encode("utf-8")
+
+# ---------- открытие страницы / выполнение задачи ----------
+def task_urls(task):
+    if task[0] == "results":
+        return [URL_RES + (f"?date={task[1]}" if task[1] else "")]
+    urls = [LINE_URL]
+    for u in ("https://fon.bet/sports/table-tennis", "https://fon.bet/line/table-tennis"):
+        if u not in urls: urls.append(u)
+    return urls
+
+async def open_page(task):
+    page = S["page"]
+    sel = SEL_LINE if task[0] == "line" else SEL_RES
+    for u in task_urls(task):
+        try:
+            await page.goto(u, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
+            await dismiss_banners(page)
+            if await captcha_field(page): return "captcha"
+            await page.wait_for_selector(sel, timeout=15000)
+            return "ok"
+        except Exception:
+            continue
+    if task[0] == "line":   # запасной путь: кликнуть спорт в сайдбаре
+        try:
+            await page.goto("https://fon.bet/sports", wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
+            await dismiss_banners(page)
+            if await captcha_field(page): return "captcha"
+            await page.get_by_text("Настольный теннис").first.click(timeout=5000)
+            await page.wait_for_selector(SEL_LINE, timeout=20000)
+            return "ok"
+        except Exception:
+            return "fail"
+    return "fail"
+
+async def complete_task(bot, chat_id):
+    """Страница открыта (или капча пройдена) — собираем и отправляем."""
+    task, night, page = S["task"], S["night"], S["page"]
+    sel = SEL_LINE if task[0] == "line" else SEL_RES
+    if not await page.locator(sel).count():
+        st = await open_page(task)
+        if st == "captcha":
+            S["ts"] = now()
+            await bot.send_photo(chat_id, await page.screenshot(), caption="🔐 Снова капча. Пришли ответ текстом:")
+            return
+        if st == "fail":
+            await bot.send_photo(chat_id, await page.screenshot(), caption="❌ Страница не прогрузилась.")
+            await close_session(False); return
+    if task[0] == "line":
+        raw = await scroll_collect(page, COLLECT_LINE)
+        if not raw:
+            await bot.send_message(chat_id, "❌ Линия пуста (строк нет).")
+            await close_session(False); return
+        n, payload = make_line_csv(raw)
+        fname = f"Линия_ТТ_{now().strftime('%Y-%m-%d_%H%M')}.csv"
+        cap = f"📋 Линия настольный теннис: {n} матчей (на {now().strftime('%H:%M')} МСК)"
+    else:
+        raw = await scroll_collect(page, COLLECT_RES)
+        iso = task[1]; date_str = label(iso)
+        n, payload = make_results_csv(raw, date_str, iso is None)
+        if not n:
+            await bot.send_message(chat_id, f"❌ За {date_str} завершённых матчей нет.")
+            await close_session(False); return
+        fname = f"Результаты_ТТ_{date_str.replace('.', '-')}_{now().strftime('%H%M')}.csv"
+        cap = f"{'🌙 Автовыгрузка' if night else '✅'} за {date_str}: {n} матчей"
+        if night: cap += " (за вчера не было запросов)"
+        else:
+            META["last_manual"] = date_str; save_meta()
+    await close_session(True)
+    await bot.send_document(chat_id, document=io.BytesIO(payload), filename=fname, caption=cap)
+
+async def run_task(bot, chat_id, task, night=False):
     async with lock:
         if idle_expired(): await close_session(False)
-        if S["waiting"]: return None, None, "⏳ Уже жду ответ на капчу."
+        if S["waiting"]:
+            await bot.send_message(chat_id, "🔐 Жду ответ на капчу выше."); return
         await ensure_browser()
-        page = S["page"]
-        await page.goto(url_for(iso), wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(3500)
-        for txt in ("Принять", "Согласен", "Понятно", "OK"):
-            try:
-                b = page.get_by_text(txt, exact=True)
-                if await b.count(): await b.first.click(timeout=700)
-            except Exception: pass
-        try:
-            tab = page.get_by_text("Завершенные", exact=True)
-            if await tab.count(): await tab.first.click(timeout=1500)
-        except Exception: pass
-        try:
-            await page.wait_for_selector('div[class*="results-event--"]', timeout=25000)
-        except Exception:
-            shot = await page.screenshot()
-            S.update(waiting=True, chat=chat_id, target=iso, night=night, ts=now())
-            return None, shot, "🔐 Фонбет просит капчу. Пришли ответ текстом — я продолжу."
-        raw = await harvest(page)
-        if not raw:
-            shot = await page.screenshot()
+        st = await open_page(task)
+        if st == "captcha":
+            S.update(waiting=True, chat=chat_id, ts=now(), task=task, night=night)
+            await bot.send_photo(chat_id, await S["page"].screenshot(),
+                caption="🔐 Фонбет просит капчу. Пришли ответ текстом — я продолжу.")
+            return
+        if st == "fail":
+            shot = await S["page"].screenshot()
             await close_session(False)
-            return None, shot, "Страница открылась, но матчей нет."
-        n, payload = make_csv(raw, label(iso), iso is None)
-        await close_session(True)
-        fname = f"Результаты_ТТ_{label(iso).replace('.', '-')}_{now().strftime('%H%M')}.csv"
-        cap = f"{'🌙 Автовыгрузка' if night else '✅'} за {label(iso)}: {n} матчей"
-        return (payload, fname, cap), None, ""
-
-async def send_res(bot, chat_id, res, shot, note):
-    if res:
-        payload, fname, cap = res
-        await bot.send_document(chat_id, document=io.BytesIO(payload), filename=fname, caption=cap)
-    elif shot:
-        await bot.send_photo(chat_id, shot, caption=note)
-    else:
-        await bot.send_message(chat_id, note)
+            await bot.send_photo(chat_id, shot, caption="❌ Страница не прогрузилась (блок IP / капча / другой URL линии).")
+            return
+        await complete_task(bot, chat_id)
 
 # ---------- команды ----------
-KB = ReplyKeyboardMarkup([[BTN]], resize_keyboard=True)
+KB = ReplyKeyboardMarkup([[BTN_RES], [BTN_LINE]], resize_keyboard=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     META["chat_id"] = update.effective_chat.id; save_meta()
     await update.message.reply_text(
-        "🏓 Результаты настольного тенниса (fon.bet)\n\n"
-        "📊 Кнопка / /results — сегодня\n"
-        "/prev — предыдущие сутки вручную\n"
-        f"🌙 В {NIGHT_HOUR:02d}:00 МСК: если за вчера не было запросов — сам пришлю вчерашний файл\n"
+        "🏓 Настольный теннис (fon.bet)\n\n"
+        f"{BTN_RES} — результаты за сегодня (/results)\n"
+        f"{BTN_LINE} — линия: кэфы, форы, тоталы (/line)\n"
+        "/prev — результаты за вчера\n"
+        f"🌙 В {NIGHT_HOUR:02d}:00 МСК: если за вчера не запрашивал результаты — сам пришлю вчерашний файл\n"
         "🔐 Капча — картинка в чат, ответь текстом\n"
-        "/reset — сброс сессии", reply_markup=KB)
+        "/reset — сброс сессии и cookies", reply_markup=KB)
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
@@ -224,13 +326,9 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat.id
     META["chat_id"] = chat; save_meta()
-    if S["waiting"]:
-        await update.message.reply_text("🔐 Жду ответ на капчу выше."); return
-    msg = await update.message.reply_text("⏳ Собираю сегодня (~1–2 мин)…")
+    msg = await update.message.reply_text("⏳ Собираю результаты за сегодня (~1–2 мин)…")
     try:
-        res, shot, note = await run_collect(chat)
-        if res: META["last_manual"] = now().strftime("%d.%m.%Y"); save_meta()
-        await send_res(context.bot, chat, res, shot, note)
+        await run_task(context.bot, chat, ("results", None))
         await msg.delete()
     except Exception as e:
         log.exception("results")
@@ -241,13 +339,23 @@ async def prev_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat.id
     META["chat_id"] = chat; save_meta()
     iso = (now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    msg = await update.message.reply_text(f"⏳ Собираю {label(iso)}…")
+    msg = await update.message.reply_text(f"⏳ Собираю результаты за {label(iso)}…")
     try:
-        res, shot, note = await run_collect(chat, iso)
-        if res: META["last_manual"] = label(iso); save_meta()
-        await send_res(context.bot, chat, res, shot, note)
+        await run_task(context.bot, chat, ("results", iso))
         await msg.delete()
     except Exception as e:
+        await msg.edit_text(f"❌ {str(e)[:250]}")
+        await close_session(False)
+
+async def line_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat.id
+    META["chat_id"] = chat; save_meta()
+    msg = await update.message.reply_text("⏳ Собираю линию настольного тенниса (~1–2 мин)…")
+    try:
+        await run_task(context.bot, chat, ("line", None))
+        await msg.delete()
+    except Exception as e:
+        log.exception("line")
         await msg.edit_text(f"❌ {str(e)[:250]}")
         await close_session(False)
 
@@ -275,16 +383,7 @@ async def captcha_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 S["ts"] = now()
                 await update.message.reply_photo(await page.screenshot(), caption="❌ Не приняло. Новая капча:")
                 await msg.delete(); return
-            if not await page.locator('div[class*="results-event--"]').count():
-                await page.goto(url_for(S["target"]), wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_selector('div[class*="results-event--"]', timeout=25000)
-            raw = await harvest(page)
-            n, payload = make_csv(raw, label(S["target"]), S["target"] is None)
-            night = S["night"]
-            await close_session(True)
-            fname = f"Результаты_ТТ_{label(S['target'] or now().strftime('%Y-%m-%d')).replace('.', '-')}_{now().strftime('%H%M')}.csv"
-            await context.bot.send_document(chat, document=io.BytesIO(payload), filename=fname,
-                caption=f"{'🌙 Автовыгрузка' if night else '✅'} за {label(S['target'])}: {n} матчей")
+            await complete_task(context.bot, chat)
             await msg.delete()
         except Exception as e:
             log.exception("captcha")
@@ -295,14 +394,11 @@ async def night_job(context: ContextTypes.DEFAULT_TYPE):
     chat = META.get("chat_id")
     if not chat:
         log.warning("night: нет chat_id (нажми /start)"); return
-    prev_iso = (now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    if META.get("last_manual") == label(prev_iso):
-        log.info("night: пропуск — за %s уже были запросы", label(prev_iso)); return
+    prev = (now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if META.get("last_manual") == label(prev):
+        log.info("night: пропуск — за %s уже были запросы", label(prev)); return
     try:
-        res, shot, note = await run_collect(chat, prev_iso, night=True)
-        if res:
-            res = (res[0], res[1], res[2] + " (за вчера не было запросов)")
-        await send_res(context.bot, chat, res, shot, "🌙 Ночной сбор: " + (note or ""))
+        await run_task(context.bot, chat, ("results", prev), night=True)
     except Exception:
         log.exception("night job")
 
@@ -312,10 +408,12 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler(["results", "tt"], results))
     app.add_handler(CommandHandler("prev", prev_cmd))
-    app.add_handler(MessageHandler(filters.Text([BTN]), results))
+    app.add_handler(CommandHandler(["line", "line_tt"], line_cmd))
+    app.add_handler(MessageHandler(filters.Text([BTN_RES]), results))
+    app.add_handler(MessageHandler(filters.Text([BTN_LINE]), line_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, captcha_answer))
     app.job_queue.run_daily(night_job, time=dtime(hour=NIGHT_HOUR, minute=0, tzinfo=MSK))
-    log.info("Бот запущен. Ночная выгрузка в %02d:00 МСК при отсутствии запросов", NIGHT_HOUR)
+    log.info("Бот запущен: результаты + линия, ночная выгрузка в %02d:00 МСК", NIGHT_HOUR)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
